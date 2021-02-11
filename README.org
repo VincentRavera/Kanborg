@@ -1,0 +1,18 @@
+#+TITLE: Kanborg
+
+An Kanboard client implementation for Emacs
+The project is a Work in Progress.
+Look at the Roadmap for more infos.
+
+* Usage
+TODO
+* Roadmap
+
+- [ ] Requests to Kanboard Server
+- [ ] Handle Self-signed and insecure Kanboard
+- [X] Parse json response to an org buffer
+- [ ] Parse org buffer to json
+- [ ] Update remote unitarly
+- [-] Update local with Diffs
+  + [X] Implementation
+  + [ ] Sort to avoid mixeup

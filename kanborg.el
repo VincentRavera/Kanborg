@@ -1,4 +1,4 @@
-;;; kanborg.el --- A kanboard to org converter -*- lexical-binding: t; -*-
+
 ;;
 ;; Copyright (C) 2021 Vincent RAVERA
 ;;
@@ -24,46 +24,78 @@
 ; Configuration options
 ; ----------------------------------------------------------------------
 
-(setq kanborg/task-json-path "./task.json")
 (setq kanborg/task-data nil)
-(setq kanborg/task-org-file "./tasks.org")
-(setq kanborg/columns-json-path "./columns.json")
 (setq kanborg/columns-data nil)
+(setq kanborg/project-id 7)
+(setq kanborg/url "https://your-kan-board/")
+(setq kanborg/user-token "user:token")
+(setq kanborg/task-org-file "~/Documents/ORG/AGENDA/Work/kanb.org")
 
 ; ----------------------------------------------------------------------
 ; Load needed packages
 ; ----------------------------------------------------------------------
-;; (require 'request)
+(require 'url)
+(require 'cl-lib)
 (require 'json)
 (require 'org-element)
+(require 'seq)
 ;; (require 'cl)
 
 
 ; ----------------------------------------------------------------------
-; Get authentication token via API
+; Communication functions
 ; ----------------------------------------------------------------------
 
-;; (defun kanborg/get-project (user pass url)
-;;   (progn
-;;     (request
-;;      (concat url "jsonrpc.php")
-;;      :type "POST"
-;;      :parser 'json-read
-;;      :data "jsonrpc=2.0&id=1&method=getMyProjects"
-;;      ;; :username user
-;;      ;; :password pass
-;;      :headers '(("Content-Type" . "application/json")
-;;                 ("Accept" . "application/json"))
-;;      :sync t
-;;      :success (function*
-;;                 (lambda (&key data &allow-other-keys)
-;;                   (message "Done: %s" (request-response-status-code data))
-;;                   (setq myresponse data))))
-;;     myresponse))
+(defun kanborg/headers ()
+  "Return the header for kanboard requests."
+  (cl-acons "Authorisation" kanborg/user-token
+         (cl-acons "Accept" "*/*"
+                (cl-acons "Content-Type" "application/json"
+                       nil))))
 
-;; Ignore tls and certs
-;; (advice-add 'gnutls-available-p :around #'ignore)
-;;
+(defun kanborg/get-columns (url)
+  "Get the columns information from the URL."
+  (let ((url-request-method "POST")
+        (url-request-extra-headers (kanborg/headers))
+        (url-debug t)
+        (url-request-data (json-encode
+                           (kanborg/columns-json-tempate kanborg/project-id))))
+    (with-current-buffer (url-retrieve-synchronously (concat url "/jsonrpc.php"))
+      (goto-char url-http-end-of-headers)
+      (kanborg/column-json-parse (json-read)))))
+
+
+(defun kanborg/columns-json-tempate (projectid)
+  "Return the json object for columns, for the project PROJECTID."
+  (cl-acons 'jsonrpc "2.0"
+         (cl-acons 'id 1
+                (cl-acons 'method "getColumns"
+                       (cl-acons 'params (vector projectid)
+                              nil)))))
+
+(defun kanborg/get-tasks (url)
+  "Get the tasks information from the URL."
+  (when (equal nil kanborg/columns-data)
+    (kanborg/get-columns url))
+  (let ((url-request-method "POST")
+        (url-request-extra-headers (kanborg/headers))
+        (url-debug t)
+        (url-request-data (json-encode
+                           (kanborg/tasks-json-tempate kanborg/project-id))))
+    (with-current-buffer (url-retrieve-synchronously (concat url "/jsonrpc.php"))
+      (goto-char url-http-end-of-headers)
+
+      (kanborg/task-json-parse (json-read)))))
+
+(defun kanborg/tasks-json-tempate (projectid)
+  "Return the json object for tasks, for the project PROJECTID."
+  (cl-acons 'jsonrpc "2.0"
+         (cl-acons 'id 1
+                (cl-acons 'method "getAllTasks"
+                       (cl-acons 'params
+                              (cl-acons 'project_id projectid
+                                     (cl-acons 'status_id 1 nil))
+                              nil)))))
 
 ;;; ----------------------------------------------------------------------
 ;;; Columns Processing
@@ -77,18 +109,14 @@
 (defun kanborg/process-column (col)
   "Extract a collumn COL id to title."
   (let-alist col
-      (list (string-to-number .id) .title)))
+    (list (string-to-number .id) .title)))
 
-(defun kanborg/column-json-parse (&optional arg)
-  "Parse the Kanboard columns Jsons with ARG is a path."
-  (interactive)
-  (if (equal nil arg)
-      (kanborg/column-json-parse kanborg/columns-json-path)
-    (with-temp-buffer
-      (insert-file-contents arg)
-      (goto-char 1)
-      (let ((results (cdr (assq 'result (json-read)))))
-        (setq kanborg/columns-data (mapcar 'kanborg/process-column results))))))
+(defun kanborg/column-json-parse (json-columns)
+  "Build columns from JSON-COLUMNS data structure."
+  (let ((results (cdr (assq 'result json-columns))))
+    (setq kanborg/columns-data (reduce
+                                (lambda (a b) (append a b))
+                                (mapcar 'kanborg/process-column results)))))
 
 ;;; ----------------------------------------------------------------------
 ;;; Tasks Processing
@@ -98,22 +126,17 @@
 ;;
 ;; Task data from an extracted json is stored on
 
-(defun kanborg/task-json-parse (&optional arg)
-  "Parse the Kanboard task Jsons with ARG is a path."
-  (interactive)
-  (if (equal nil arg)
-      (kanborg/task-json-parse kanborg/task-json-path)
-      (with-temp-buffer
-        (insert-file-contents arg)
-        (goto-char 1)
-        (setq kanborg/task-data (json-read)))))
+(defun kanborg/task-json-parse (&optional json-tasks)
+  "Build tasks from JSON-TASKS data structure."
+      (kanborg/conversion-json-to-org (setq kanborg/task-data json-tasks)))
 
-(defun kanborg/process-task (task)
+(defun kanborg/process-json-task (task)
   "Parse a json TASK data structure and outputs the Org data structure."
+  ;; (setq toto task)
   (let ((id (cdr (assq 'id task)))
         (title (cdr (assq 'title task)))
         (description (cdr (assq 'description  task)))
-        (state (car (alist-get (string-to-number (cdr (assq 'column_id task))) kanborg/columns-data)))
+        (state (plist-get kanborg/columns-data (string-to-number (cdr (assq 'column_id task)))))
         (url (cdr (assq 'url task)))
         (deadline (cdr (assq 'date_due task)))
         (schedule (cdr (assq 'date_started task))))
@@ -157,7 +180,39 @@ SCHEDULE id equals to '0' will not add a schedule block"
                           (org-element-create 'node-property
                                               (list :key "ORIGIN"
                                                     :value "KANBORG")))
-      description))))
+      (decode-coding-string description 'utf-8)))))
+      ;; description))))
+
+(defun kanborg/process-org-task (org-task)
+  "Parse an ORG-TASK data structure and outputs the JSON data structure."
+  (let ((id (org-element-property :ID task))
+        (title (org-element-property :title task))
+        (description (cdr (assq 'description  task)))
+        ;; Reverse plist-get with a equal
+        (state (plist-get
+                (reverse kanborg/columns-data)
+                (car (seq-filter
+                      (lambda (a) (equal a (org-element-property :todo-keyword task)))
+                      kanborg/columns-data))))
+        (url (cdr (assq 'url task)))
+        (deadline (kanborg/date-to-epoch (org-element-property :deadline task)))
+        (schedule (kanborg/date-to-epoch (org-element-property :scheduled task))))
+    (kanborg/task-generate-json-elem
+     id title description state url deadline schedule)
+    )
+
+  )
+(defun kanborg/task-generate-json-elem (id title description state url deadline schedule)
+  "Template to generate an org data structure.
+
+ID is the id of the Kanboard task,
+TITLE is the title of the Kanboard task,
+DESCRIPTION is the text of the Kanboard task,
+STATE is the swimlane of the Kanboard task,
+URL is a direct url to view the task,
+DEADLINE if equals to '0' will not add a deadline block
+SCHEDULE id equals to '0' will not add a schedule block"
+  )
 
 ;;; ----------------------------------------------------------------------
 ;;; Conversions
@@ -174,10 +229,14 @@ Or JSON-DATA the data structure extarcted from the api."
         (with-current-buffer buffer
           (insert
            (org-element-interpret-data
-            (mapcar 'kanborg/process-task tasks)))))))
+            (mapcar 'kanborg/process-json-task tasks)))
+          buffer))))
 
 ;; ORG -> JSON
 
+(defun kanborg/conversion-org-to-json (&optional org-data)
+  "Convert ORG-DATA the data structure extarcted from the api."
+  )
 ;;; ----------------------------------------------------------------------
 ;;; Utils
 ;;; ----------------------------------------------------------------------
@@ -185,21 +244,34 @@ Or JSON-DATA the data structure extarcted from the api."
 ;; BUFFER: org tasks buffer
 (defun kanborg/tasks-get-org-buffer ()
   "Return the Buffer we are allowed to write into."
-  (get-buffer-create "*KanBorg:Tasks:ORG*"))
+  (let ((buffername "*KanBorg:Tasks:ORG*"))
+    (kill-buffer (get-buffer-create buffername))
+    (let ((buffer (get-buffer-create buffername)))
+      (with-current-buffer buffer
+        (org-mode))
+      buffer)))
 
 ;; BUFFER: json tasks buffer
 (defun kanborg/task-get-json-buffer ()
   "Return the Buffer were the json tasks are."
   (if (equal nil kanborg/task-json-path)
-      (get-buffer-create "KanBorg:Tasks:JSON")
+      (get-buffer-create "*KanBorg:Tasks:JSON*")
     (find-file kanborg/task-json-path)))
 
 ;; BUFFER: json columns buffer
 (defun kanborg/column-get-json-buffer ()
   "Return the Buffer were the json collumns are."
   (if (equal nil kanborg/column-json-path)
-      (get-buffer-create "KanBorg:Column:JSON")
+      (get-buffer-create "*KanBorg:Column:JSON*")
     (find-file kanborg/column-json-path)))
+;; URL-BUFFERS:
+(defun kanborg/columns-url-callback (status)
+  "Switch to the buffer returned by `url-retreive'.
+The buffer contains the raw HTTP response sent by the server.
+STATUS the response status."
+  (message "Kanborg:GET:Collumns:%s" status)
+  (rename-buffer "*KanBorg:Column:JSON*")
+  (switch-to-buffer (current-buffer)))
 
 ;; TIME: json -> org
 (defun kanborg/epoch-to-date (epoch-string)
@@ -224,20 +296,33 @@ Or JSON-DATA the data structure extarcted from the api."
   (interactive)
   (if (equal nil kanborg/task-org-file)
       (message "Please specify kanborg/tasks-org-file to compare remote tasks and local.")
-    (kanborg/conversion-json-to-org (kanborg/task-json-parse))
-    (ediff-buffers (kanborg/tasks-get-org-buffer) (find-file kanborg/task-org-file))))
+    (let ((kanbuffer (kanborg/get-tasks kanborg/url)))
+      (ediff-buffers kanbuffer (find-file kanborg/task-org-file)))))
 
-;; Unitary: Pull
+;; TODO Unitary: Pull
 (defun kanborg/pull-and-compare-at-point ()
   "Update task at point. Pops up a diff buffer."
   (let ((task-org (org-element-at-point)))
     task-org))
 
 ;; Unitary: Push
-(defun kanborg/push-and-compare-at-point ()
-  "Update task at point. Pops up a diff buffer."
+(defun kanborg/push-at-point ()
+  "Push current task at point to the server."
+  (interactive)
   (let ((task-org (org-element-at-point)))
-    task-org))
+    ;; Does not give enough information
+    ;; Validation is a headline
+    (if (not (equal 'headline (car task-org)))
+        (message "Please redo at headline")
+      (setq mdata
+            (org-element-map (org-element-parse-buffer) 'headline
+              (lambda (hl)
+                (when (string= (encode-coding-string (org-element-property :ID hl) 'utf-8)
+                               (encode-coding-string (org-element-property :ID task-org) 'utf-8))
+                  hl))
+              nil t)))
+    ;; (kanborg/conversion-org-to-json org-data-full)
+    ))
 
 (provide 'kanborg)
 ;; ;;
@@ -263,14 +348,13 @@ Or JSON-DATA the data structure extarcted from the api."
 ;;
 ;; TESTs
 ;;
-;; (setq kanborg/task-json-path "./ticket.json")
-;; (setq kanborg/task-data nil)
-;; (setq kanborg/columns-json-path "./columns.json")
-;; (setq kanborg/columns-data nil)
 ;; (kanborg/column-json-parse)
 ;; (kanborg/task-json-parse)
 ;; (kanborg/conversion-json-to-org (kanborg/task-json-parse))
 ;; (setq mydata (kanborg/task-generate-org-elem 1991 "Toto" "Hello" "TODO" "http://example.com" "1611915616" "1611905616" ))
+;;
+;; (kanborg/get-columns kanborg/url)
+;; (kanborg/get-tasks kanborg/url)
 
 
 ;;; kanborg.el ends here
